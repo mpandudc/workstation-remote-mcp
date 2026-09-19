@@ -3,10 +3,12 @@
 A lightweight Model Context Protocol (MCP) server built with **FastMCP** to control, inspect, and automate a Windows PC / workstation remotely via Wake-on-LAN and SSH/PowerShell.
 
 ## Features
-- **`pc_wake`**: Send Wake-on-LAN (WOL) magic packet across LAN broadcast (ports 7, 9) to power on workstation.
+- **`pc_wake`**: Power **ON** the PC via Wake-on-LAN (WOL) magic packet across LAN broadcast (ports 7, 9).
+- **`pc_shutdown`**: Power **OFF** / complete shutdown of Windows PC (`shutdown.exe /s /f /t 0`).
+- **`pc_reboot`**: Restart / reboot Windows PC (`shutdown.exe /r /f /t 0`).
+- **`pc_sleep`**: Suspend workstation to S3 standby mode.
 - **`pc_status`**: Check online state, Windows OS caption, uptime, CPU load percentage, and RAM usage.
 - **`pc_lock`**: Instantly lock workstation session (`rundll32.exe user32.dll,LockWorkStation`).
-- **`pc_sleep`**: Suspend workstation to S3 standby mode.
 - **`pc_list_heavy_processes`**: Identify processes consuming top RAM/CPU.
 - **`pc_kill_process`**: Terminate hung or runaway processes by name or PID.
 

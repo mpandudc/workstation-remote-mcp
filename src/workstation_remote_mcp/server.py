@@ -147,6 +147,46 @@ async def pc_kill_process(name_or_pid: str) -> Dict[str, Any]:
         return {"status": "error", "error": stderr or f"Process {name_or_pid} not found or access denied."}
     return {"status": "success", "message": f"Killed process: {name_or_pid}."}
 
+@mcp.tool()
+async def pc_shutdown(delay_seconds: int = 0, force: bool = True) -> Dict[str, Any]:
+    """Power off / shutdown the Windows PC completely (Power OFF).
+    
+    Args:
+        delay_seconds: Delay before shutting down (default: 0 for instant).
+        force: Force close running applications without prompting (default: True).
+    """
+    f_flag = "/f" if force else ""
+    cmd = f"shutdown.exe /s {f_flag} /t {delay_seconds}"
+    code, stdout, stderr = await run_ssh(cmd, timeout=5)
+    if code != 0:
+        return {"status": "error", "error": stderr or "Failed to initiate shutdown."}
+    return {
+        "status": "triggered",
+        "action": "shutdown",
+        "delay_seconds": delay_seconds,
+        "message": "Windows PC shutdown initiated. To power back ON later, use `pc_wake`."
+    }
+
+@mcp.tool()
+async def pc_reboot(delay_seconds: int = 0, force: bool = True) -> Dict[str, Any]:
+    """Restart / reboot the Windows PC.
+    
+    Args:
+        delay_seconds: Delay before restarting (default: 0 for instant).
+        force: Force close running applications without prompting (default: True).
+    """
+    f_flag = "/f" if force else ""
+    cmd = f"shutdown.exe /r {f_flag} /t {delay_seconds}"
+    code, stdout, stderr = await run_ssh(cmd, timeout=5)
+    if code != 0:
+        return {"status": "error", "error": stderr or "Failed to initiate restart."}
+    return {
+        "status": "triggered",
+        "action": "reboot",
+        "delay_seconds": delay_seconds,
+        "message": "Windows PC reboot initiated."
+    }
+
 def main():
     parser = argparse.ArgumentParser(description="Workstation Remote FastMCP Server")
     parser.add_argument("--transport", default="stdio", choices=["stdio", "sse", "http"])
