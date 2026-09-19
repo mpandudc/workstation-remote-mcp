@@ -1,0 +1,15 @@
+[project]
+name = "workstation-remote-mcp"
+version = "0.1.0"
+description = "FastMCP server for remote Windows workstation control (Wake-on-LAN, power state, lock, and process telemetry)"
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=0.4.0",
+    "pydantic>=2.0.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
