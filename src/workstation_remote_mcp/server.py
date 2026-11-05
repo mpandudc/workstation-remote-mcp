@@ -1,3 +1,6 @@
+import functools
+import re
+import shlex
 import argparse
 import asyncio
 import json
@@ -13,6 +16,28 @@ logger = logging.getLogger("workstation-remote-mcp")
 mcp = FastMCP(
     name="workstation-remote-mcp",
 )
+
+
+# Administrative tools are absent from ordinary discovery and guarded on direct calls.
+_ADMIN_ENABLED = False
+_ADMIN_TOOLS = []
+
+def admin_tool(fn):
+    @functools.wraps(fn)
+    async def guarded(*args, **kwargs):
+        if not _ADMIN_ENABLED:
+            raise PermissionError("Administrative tool requires a separate explicit --admin stdio session")
+        return await fn(*args, **kwargs)
+    _ADMIN_TOOLS.append(guarded)
+    return guarded
+
+def enable_admin():
+    global _ADMIN_ENABLED
+    if not _ADMIN_ENABLED:
+        for fn in _ADMIN_TOOLS:
+            mcp.tool()(fn)
+        _ADMIN_ENABLED = True
+
 
 @mcp.tool()
 def pc_wake(mac_address: Optional[str] = None) -> Dict[str, Any]:
@@ -36,26 +61,27 @@ def pc_wake(mac_address: Optional[str] = None) -> Dict[str, Any]:
 @mcp.tool()
 async def pc_status() -> Dict[str, Any]:
     """Check online connectivity and basic health (RAM, OS uptime, CPU) of the Windows PC."""
-    ps_cmd = (
-        'powershell -NoProfile -Command "'
-        "$os = Get-CimInstance Win32_OperatingSystem; "
-        "$cpu = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average; "
-        "[PSCustomObject]@{ "
-        "Caption = $os.Caption; "
-        "UptimeHours = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalHours, 1); "
-        "TotalRamGB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2); "
-        "FreeRamGB = [math]::Round($os.FreePhysicalMemory / 1MB, 2); "
-        "CpuLoadPercent = $cpu "
-        "} | ConvertTo-Json -Compress\""
-    )
+    ps_cmd = 'powershell -NoProfile -NonInteractive -EncodedCommand JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIAAkAG8APQBHAGUAdAAtAEMAaQBtAEkAbgBzAHQAYQBuAGMAZQAgAFcAaQBuADMAMgBfAE8AcABlAHIAYQB0AGkAbgBnAFMAeQBzAHQAZQBtADsAIAAkAGMAPQAoAEcAZQB0AC0AQwBpAG0ASQBuAHMAdABhAG4AYwBlACAAVwBpAG4AMwAyAF8AUAByAG8AYwBlAHMAcwBvAHIAIAB8ACAATQBlAGEAcwB1AHIAZQAtAE8AYgBqAGUAYwB0ACAALQBQAHIAbwBwAGUAcgB0AHkAIABMAG8AYQBkAFAAZQByAGMAZQBuAHQAYQBnAGUAIAAtAEEAdgBlAHIAYQBnAGUAKQAuAEEAdgBlAHIAYQBnAGUAOwAgAFsAcABzAGMAdQBzAHQAbwBtAG8AYgBqAGUAYwB0AF0AQAB7AEMAYQBwAHQAaQBvAG4APQAkAG8ALgBDAGEAcAB0AGkAbwBuADsAIABVAHAAdABpAG0AZQBIAG8AdQByAHMAPQBbAG0AYQB0AGgAXQA6ADoAUgBvAHUAbgBkACgAKAAoAEcAZQB0AC0ARABhAHQAZQApAC0AJABvAC4ATABhAHMAdABCAG8AbwB0AFUAcABUAGkAbQBlACkALgBUAG8AdABhAGwASABvAHUAcgBzACwAMQApADsAIABDAHAAdQBMAG8AYQBkAFAAZQByAGMAZQBuAHQAPQAkAGMAOwAgAFQAbwB0AGEAbABSAGEAbQBHAEIAPQBbAG0AYQB0AGgAXQA6ADoAUgBvAHUAbgBkACgAJABvAC4AVABvAHQAYQBsAFYAaQBzAGkAYgBsAGUATQBlAG0AbwByAHkAUwBpAHoAZQAvADEATQBCACwAMgApADsAIABGAHIAZQBlAFIAYQBtAEcAQgA9AFsAbQBhAHQAaABdADoAOgBSAG8AdQBuAGQAKAAkAG8ALgBGAHIAZQBlAFAAaAB5AHMAaQBjAGEAbABNAGUAbQBvAHIAeQAvADEATQBCACwAMgApAH0AIAB8ACAAQwBvAG4AdgBlAHIAdABUAG8ALQBKAHMAbwBuACAALQBDAG8AbQBwAHIAZQBzAHMA'
 
-    code, stdout, stderr = await run_ssh(ps_cmd, timeout=4)
+    # Health query (PowerShell + CIM) can be slow on a freshly booted or
+    # memory-starved PC, so give it room and never equate a failed health
+    # query with "offline" without a separate reachability probe.
+    code, stdout, stderr = await run_ssh(ps_cmd, timeout=15)
     if code != 0:
+        probe_code, probe_out, probe_err = await run_ssh("cmd /c echo ok", timeout=5)
+        if probe_code == 0 and "ok" in probe_out:
+            return {
+                "online": True,
+                "host": config.host_tailscale,
+                "health": "unavailable",
+                "error": stderr or f"Health query failed with exit code {code}",
+            }
         return {
             "online": False,
             "host": config.host_tailscale,
-            "error": stderr or "Host unreachable via SSH. PC might be asleep or powered off.",
-            "suggestion": "Call `pc_wake` to send a Wake-on-LAN packet."
+            "reason": "timeout" if probe_code == 124 else "ssh_error",
+            "error": probe_err or stderr or "Host unreachable via SSH. PC might be asleep or powered off.",
+            "suggestion": "Call `pc_wake` to send a Wake-on-LAN packet.",
         }
 
     try:
@@ -85,7 +111,7 @@ async def pc_status() -> Dict[str, Any]:
             "parse_error": str(e)
         }
 
-@mcp.tool()
+@admin_tool
 async def pc_lock() -> Dict[str, Any]:
     """Lock the active Windows session immediately (equivalent to Win + L)."""
     code, stdout, stderr = await run_ssh('rundll32.exe user32.dll,LockWorkStation', timeout=5)
@@ -93,7 +119,7 @@ async def pc_lock() -> Dict[str, Any]:
         return {"status": "error", "error": stderr or "Failed to lock workstation."}
     return {"status": "success", "message": "Workstation locked successfully."}
 
-@mcp.tool()
+@admin_tool
 async def pc_sleep() -> Dict[str, Any]:
     """Put the Windows PC into S3 sleep / suspended mode via SSH. Can be woken up later via `pc_wake`."""
     # Using powershell SetSuspendState (Suspend, Force, DisableWakeEvent=False)
@@ -109,12 +135,7 @@ async def pc_sleep() -> Dict[str, Any]:
 async def pc_list_heavy_processes(top_n: int = 10) -> Dict[str, Any]:
     """List processes consuming the highest RAM or CPU on the Windows PC."""
     top_n = max(1, min(top_n, 30))
-    ps_cmd = (
-        f'powershell -NoProfile -Command "'
-        f"Get-Process | Sort-Object -Property WorkingSet64 -Descending | Select-Object -First {top_n} "
-        "ProcessName, Id, @{Name='WorkingSetMB';Expression={[math]::Round($_.WorkingSet64/1MB,1)}} | "
-        'ConvertTo-Json -Compress"'
-    )
+    ps_cmd = f'workstation-processes-v1 {top_n}'
     code, stdout, stderr = await run_ssh(ps_cmd, timeout=6)
     if code != 0:
         return {"status": "error", "error": stderr or "Failed fetching processes."}
@@ -129,25 +150,32 @@ async def pc_list_heavy_processes(top_n: int = 10) -> Dict[str, Any]:
     except Exception as e:
         return {"status": "error", "error": f"Failed parsing process list: {e}", "raw": stdout}
 
-@mcp.tool()
+@admin_tool
 async def pc_kill_process(name_or_pid: str) -> Dict[str, Any]:
     """Terminate a runaway or hung process on the Windows PC by name or PID.
 
     Args:
         name_or_pid: Process name (e.g. 'chrome', 'node') or integer PID.
     """
-    if name_or_pid.isdigit():
-        ps_cmd = f'powershell -NoProfile -Command "Stop-Process -Id {name_or_pid} -Force"'
+    # Keep both PowerShell and the Windows SSH shell boundary free of syntax.
+    if re.fullmatch(r"[0-9]+", name_or_pid):
+        if len(name_or_pid) > 10 or not 1 <= int(name_or_pid) <= 2147483647:
+            raise ValueError("PID must be a positive signed 32-bit integer")
+        ps_cmd = f'powershell -NoProfile -Command "Stop-Process -Id {int(name_or_pid)} -Force"'
     else:
-        clean_name = name_or_pid.replace(".exe", "").strip()
-        ps_cmd = f'powershell -NoProfile -Command "Stop-Process -Name {clean_name} -Force"'
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._()-]{0,127}", name_or_pid):
+            raise ValueError("Process name contains unsupported characters")
+        clean_name = re.sub(r"\.exe$", "", name_or_pid, flags=re.IGNORECASE).strip()
+        if not clean_name:
+            raise ValueError("Process name cannot be empty")
+        ps_cmd = f'powershell -NoProfile -Command "Stop-Process -Name \'{clean_name}\' -Force"'
 
     code, stdout, stderr = await run_ssh(ps_cmd, timeout=6)
     if code != 0:
         return {"status": "error", "error": stderr or f"Process {name_or_pid} not found or access denied."}
     return {"status": "success", "message": f"Killed process: {name_or_pid}."}
 
-@mcp.tool()
+@admin_tool
 async def pc_shutdown(delay_seconds: int = 0, force: bool = True) -> Dict[str, Any]:
     """Power off / shutdown the Windows PC completely (Power OFF).
     
@@ -167,7 +195,7 @@ async def pc_shutdown(delay_seconds: int = 0, force: bool = True) -> Dict[str, A
         "message": "Windows PC shutdown initiated. To power back ON later, use `pc_wake`."
     }
 
-@mcp.tool()
+@admin_tool
 async def pc_reboot(delay_seconds: int = 0, force: bool = True) -> Dict[str, Any]:
     """Restart / reboot the Windows PC.
     
@@ -192,7 +220,12 @@ def main():
     parser.add_argument("--transport", default="stdio", choices=["stdio", "sse", "http"])
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument("--admin", action="store_true", help="Enable admin tools in a separate stdio session only")
     args = parser.parse_args()
+    if args.admin:
+        if args.transport != "stdio":
+            parser.error("--admin is restricted to explicit stdio sessions; shared HTTP/SSE stays read-only")
+        enable_admin()
 
     if args.transport in {"sse", "http"}:
         mcp.run(transport=args.transport, host=args.host, port=args.port)

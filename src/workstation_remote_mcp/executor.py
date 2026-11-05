@@ -26,11 +26,14 @@ async def run_ssh(cmd: str, timeout: Optional[int] = None) -> Tuple[int, str, st
     ssh_cmd = [
         "ssh",
         "-o", "BatchMode=yes",
+        "-i", "/home/mpandudc/.ssh/id_ed25519",
+        "-o", "IdentitiesOnly=yes",
         "-o", f"ConnectTimeout={timeout_val}",
         f"{config.user}@{target_host}",
         cmd,
     ]
 
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *ssh_cmd,
@@ -40,6 +43,12 @@ async def run_ssh(cmd: str, timeout: Optional[int] = None) -> Tuple[int, str, st
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_val + 2)
         return proc.returncode or 0, stdout.decode(errors="replace").strip(), stderr.decode(errors="replace").strip()
     except asyncio.TimeoutError:
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except ProcessLookupError:
+                pass
         return 124, "", f"SSH timeout after {timeout_val}s connecting to {target_host}"
     except Exception as e:
         return 1, "", str(e)
