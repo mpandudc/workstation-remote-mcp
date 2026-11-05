@@ -26,6 +26,8 @@ async def run_ssh(cmd: str, timeout: Optional[int] = None) -> Tuple[int, str, st
     ssh_cmd = [
         "ssh",
         "-o", "BatchMode=yes",
+        "-i", "/home/mpandudc/.ssh/id_ed25519",
+        "-o", "IdentitiesOnly=yes",
         "-o", f"ConnectTimeout={timeout_val}",
         f"{config.user}@{target_host}",
         cmd,

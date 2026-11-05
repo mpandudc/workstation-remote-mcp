@@ -21,3 +21,11 @@ Configurable via environment variables or default constants:
 
 ## License
 MIT
+
+## Safety policy
+
+Default sessions expose safe tools only. Proxmox power/snapshot and workstation lock/sleep/kill/shutdown/reboot are not registered and reject direct calls. Workstation wake remains available for recovery.
+
+For a human-approved maintenance operation, launch a separate local stdio process with `--admin` and separately provisioned administrative credentials. Admin is rejected on HTTP/SSE. Never add admin processes to ordinary Hermes or shared units. This is an application guard, not OS credential isolation; keep administrative SSH credentials inaccessible to ordinary agent sessions.
+
+Installed runtime: Python 3.11.16, FastMCP 4.0.5, Pydantic 2.13.5; `runtime-dependencies.txt` records all installed versions. Refresh intentionally with tests and rollback.
