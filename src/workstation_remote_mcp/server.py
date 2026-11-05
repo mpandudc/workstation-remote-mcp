@@ -63,13 +63,25 @@ async def pc_status() -> Dict[str, Any]:
     """Check online connectivity and basic health (RAM, OS uptime, CPU) of the Windows PC."""
     ps_cmd = 'powershell -NoProfile -NonInteractive -EncodedCommand JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnADsAIAAkAG8APQBHAGUAdAAtAEMAaQBtAEkAbgBzAHQAYQBuAGMAZQAgAFcAaQBuADMAMgBfAE8AcABlAHIAYQB0AGkAbgBnAFMAeQBzAHQAZQBtADsAIAAkAGMAPQAoAEcAZQB0AC0AQwBpAG0ASQBuAHMAdABhAG4AYwBlACAAVwBpAG4AMwAyAF8AUAByAG8AYwBlAHMAcwBvAHIAIAB8ACAATQBlAGEAcwB1AHIAZQAtAE8AYgBqAGUAYwB0ACAALQBQAHIAbwBwAGUAcgB0AHkAIABMAG8AYQBkAFAAZQByAGMAZQBuAHQAYQBnAGUAIAAtAEEAdgBlAHIAYQBnAGUAKQAuAEEAdgBlAHIAYQBnAGUAOwAgAFsAcABzAGMAdQBzAHQAbwBtAG8AYgBqAGUAYwB0AF0AQAB7AEMAYQBwAHQAaQBvAG4APQAkAG8ALgBDAGEAcAB0AGkAbwBuADsAIABVAHAAdABpAG0AZQBIAG8AdQByAHMAPQBbAG0AYQB0AGgAXQA6ADoAUgBvAHUAbgBkACgAKAAoAEcAZQB0AC0ARABhAHQAZQApAC0AJABvAC4ATABhAHMAdABCAG8AbwB0AFUAcABUAGkAbQBlACkALgBUAG8AdABhAGwASABvAHUAcgBzACwAMQApADsAIABDAHAAdQBMAG8AYQBkAFAAZQByAGMAZQBuAHQAPQAkAGMAOwAgAFQAbwB0AGEAbABSAGEAbQBHAEIAPQBbAG0AYQB0AGgAXQA6ADoAUgBvAHUAbgBkACgAJABvAC4AVABvAHQAYQBsAFYAaQBzAGkAYgBsAGUATQBlAG0AbwByAHkAUwBpAHoAZQAvADEATQBCACwAMgApADsAIABGAHIAZQBlAFIAYQBtAEcAQgA9AFsAbQBhAHQAaABdADoAOgBSAG8AdQBuAGQAKAAkAG8ALgBGAHIAZQBlAFAAaAB5AHMAaQBjAGEAbABNAGUAbQBvAHIAeQAvADEATQBCACwAMgApAH0AIAB8ACAAQwBvAG4AdgBlAHIAdABUAG8ALQBKAHMAbwBuACAALQBDAG8AbQBwAHIAZQBzAHMA'
 
-    code, stdout, stderr = await run_ssh(ps_cmd, timeout=10)
+    # Health query (PowerShell + CIM) can be slow on a freshly booted or
+    # memory-starved PC, so give it room and never equate a failed health
+    # query with "offline" without a separate reachability probe.
+    code, stdout, stderr = await run_ssh(ps_cmd, timeout=15)
     if code != 0:
+        probe_code, probe_out, probe_err = await run_ssh("cmd /c echo ok", timeout=5)
+        if probe_code == 0 and "ok" in probe_out:
+            return {
+                "online": True,
+                "host": config.host_tailscale,
+                "health": "unavailable",
+                "error": stderr or f"Health query failed with exit code {code}",
+            }
         return {
             "online": False,
             "host": config.host_tailscale,
-            "error": stderr or "Host unreachable via SSH. PC might be asleep or powered off.",
-            "suggestion": "Call `pc_wake` to send a Wake-on-LAN packet."
+            "reason": "timeout" if probe_code == 124 else "ssh_error",
+            "error": probe_err or stderr or "Host unreachable via SSH. PC might be asleep or powered off.",
+            "suggestion": "Call `pc_wake` to send a Wake-on-LAN packet.",
         }
 
     try:
