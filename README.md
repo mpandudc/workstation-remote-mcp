@@ -18,6 +18,14 @@ Configurable via environment variables or default constants:
 - `WORKSTATION_TS_IP`: Default `100.116.2.118` (Tailscale IP)
 - `WORKSTATION_LAN_IP`: Default `192.168.0.102` (LAN IP)
 - `WORKSTATION_MAC`: Default `9C:6B:00:A2:31:54` (Ethernet MAC)
+- `GUI_BRIDGE_TOKEN`: **required, no default.** Read from the environment, else from `WORKSTATION_ENV_FILE` (default `~mpandudc/.config/workstation-remote-mcp/bridge.env`, mode 0600, outside the repo). The server refuses to start without it.
+
+## GUI bridge (Windows)
+`windows-bridge/` holds the FastAPI bridge that runs on the PC (`pythonw.exe`, Session 1, scheduled task `OpenBot-GUI-Bridge`, port 8780):
+`gui_bridge.py` + `gui_input.py` (SendInput typing/hotkeys, UIA name matching). It reads the same `GUI_BRIDGE_TOKEN` from the environment or `.env` beside the script (ACL: owner only) and refuses to start without it.
+GUI tools: `pc_gui_status`, `pc_screenshot` (JPEG, `region`, origin/scale), `pc_run_steps` (batch with `expect_window` guard), `pc_ui_tree`, `pc_ui_click`, `pc_ui_set_text`, `pc_browser_text` (UIA, active Chrome tab).
+`sse_stdio_relay.py` is the copy of `/opt/mcp-bridge/sse_stdio.py` (stdio↔SSE relay that reconnects after server restarts).
+To rotate the token, write a new value to both env files, then restart the bridge task and `workstation-mcp.service`.
 
 ## License
 MIT

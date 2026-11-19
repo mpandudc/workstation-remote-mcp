@@ -4,7 +4,7 @@ from fastmcp import Client
 PACKAGE=os.environ["MCP_TEST_PACKAGE"]
 s=importlib.import_module(PACKAGE+".server")
 PROX=PACKAGE.startswith("proxmox")
-SAFE={"proxmox_cluster_status","lxc_list","lxc_get_info","lxc_service_status","tailscale_mesh_status"} if PROX else {"pc_wake","pc_status","pc_list_heavy_processes"}
+SAFE={"proxmox_cluster_status","lxc_list","lxc_get_info","lxc_service_status","tailscale_mesh_status"} if PROX else {"pc_wake","pc_status","pc_list_heavy_processes","pc_gui_status","pc_screenshot","pc_run_steps","pc_ui_tree","pc_ui_click","pc_ui_set_text","pc_browser_text","pc_click","pc_mouse_move","pc_mouse_drag","pc_type","pc_key","pc_scroll"}
 ADMIN={"lxc_control_power","lxc_snapshot_create"} if PROX else {"pc_lock","pc_sleep","pc_kill_process","pc_shutdown","pc_reboot"}
 ARGS={"lxc_control_power":{"vmid":203,"action":"reboot"},"lxc_snapshot_create":{"vmid":203,"snapname":"never"},"pc_kill_process":{"name_or_pid":"never"}}
 class PolicyTests(unittest.IsolatedAsyncioTestCase):

@@ -1,12 +1,19 @@
 import functools
 import re
 import shlex
+import sys
 import argparse
 import asyncio
 import json
 import logging
+import base64
+import urllib.parse
+import urllib.request
 from typing import Any, Dict, List, Optional
 from fastmcp import FastMCP
+from fastmcp.tools import ToolResult
+from fastmcp.utilities.types import Image
+from mcp.types import TextContent
 from .config import config
 from .executor import send_wol_magic_packet, run_ssh
 
@@ -150,6 +157,301 @@ async def pc_list_heavy_processes(top_n: int = 10) -> Dict[str, Any]:
     except Exception as e:
         return {"status": "error", "error": f"Failed parsing process list: {e}", "raw": stdout}
 
+
+async def _ensure_gui_bridge() -> bool:
+    """Checks if GUI bridge is responding. If not, triggers scheduled task to start it."""
+    try:
+        await asyncio.to_thread(_http, f"http://{config.host_tailscale}:{config.gui_bridge_port}/health", None, 2.5)
+        return True
+    except Exception:
+        logger.info("GUI bridge unreachable, triggering on-demand start via SSH...")
+        await run_ssh('schtasks /Run /TN "OpenBot-GUI-Bridge"', timeout=4)
+        await asyncio.sleep(1.5)
+        return False
+
+
+_NO_TOKEN = ("GUI_BRIDGE_TOKEN is not set: put it in the environment or in "
+             "WORKSTATION_ENV_FILE (default ~mpandudc/.config/workstation-remote-mcp/bridge.env)")
+
+
+def _http(url: str, body: Optional[bytes], timeout: float):
+    headers = {"x-token": config.gui_bridge_token}
+    if body:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST" if body else "GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read(), dict(resp.headers)
+
+
+async def _gui_req(path: str, data: Optional[Dict[str, Any]] = None, timeout: float = 5.0) -> Dict[str, Any]:
+    if not config.gui_bridge_token:
+        return {"status": "error", "error": _NO_TOKEN}
+    url = f"http://{config.host_tailscale}:{config.gui_bridge_port}{path}"
+    body = json.dumps(data).encode("utf-8") if data else None
+    for attempt in range(2):
+        try:
+            # Blocking urllib runs off the event loop so one slow bridge call never stalls the SSE server.
+            raw, _ = await asyncio.to_thread(_http, url, body, timeout)
+            return json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            if attempt == 0:
+                await _ensure_gui_bridge()
+            else:
+                return {"status": "error", "error": f"GUI bridge error on {path}: {e}. Ensure PC is awake and user logged in."}
+
+
+async def _gui_fetch_image(params: Dict[str, Any], timeout: float = 15.0):
+    """GET /screenshot -> (image bytes, meta dict from X-Screenshot-Meta)."""
+    if not config.gui_bridge_token:
+        raise RuntimeError(_NO_TOKEN)
+    url = f"http://{config.host_tailscale}:{config.gui_bridge_port}/screenshot?{urllib.parse.urlencode(params)}"
+    for attempt in range(2):
+        try:
+            raw, headers = await asyncio.to_thread(_http, url, None, timeout)
+            meta_raw = next((v for k, v in headers.items() if k.lower() == "x-screenshot-meta"), None)
+            meta = json.loads(meta_raw) if meta_raw else {"format": params.get("format", "jpeg"), "bytes": len(raw)}
+            return raw, meta
+        except Exception as e:
+            if attempt == 0:
+                await _ensure_gui_bridge()
+            else:
+                raise RuntimeError(f"Failed to capture Windows screenshot: {e}. Check `pc_status`.")
+
+
+def _region_csv(region: Optional[List[int]]) -> Optional[str]:
+    if region is None:
+        return None
+    if len(region) != 4:
+        raise ValueError("region must be [x0, y0, x1, y1] in screen pixels")
+    x0, y0, x1, y1 = (int(v) for v in region)
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError("region needs x1 > x0 and y1 > y0")
+    return f"{x0},{y0},{x1},{y1}"
+
+
+def _image_result(data: bytes, meta: Dict[str, Any], summary: Dict[str, Any]) -> ToolResult:
+    fmt = meta.get("format", "jpeg")
+    img = Image(data=data, format=fmt).to_image_content()
+    return ToolResult(content=[img, TextContent(type="text", text=json.dumps(summary))])
+
+
+_COORD_HINT = "screen_x = origin[0] + image_x * scale; screen_y = origin[1] + image_y * scale"
+
+
+@mcp.tool()
+async def pc_gui_status() -> Dict[str, Any]:
+    """Check status of Windows GUI automation bridge, active window, screen resolution and CDP availability."""
+    return await _gui_req("/health")
+
+
+@mcp.tool()
+async def pc_screenshot(
+    region: Optional[List[int]] = None,
+    max_width: Optional[int] = 1600,
+    quality: int = 70,
+    format: str = "jpeg",
+) -> ToolResult:
+    """Capture the Windows PC screen (primary monitor 3440x1440) as a compact JPEG.
+
+    Prefer `pc_ui_tree` / `pc_browser_text` when you need names or text; use a
+    `region` crop to look closely at one area. The text block returns `origin`
+    and `scale` to map image pixels back to click coordinates.
+
+    Args:
+        region: Optional [x0, y0, x1, y1] crop in screen pixels.
+        max_width: Max output width in pixels (default 1600; None = native).
+        quality: JPEG quality 20-95 (default 70; auto-lowered to stay under ~150 KB).
+        format: 'jpeg' (default) or 'png' (large; avoid unless needed).
+    """
+    params: Dict[str, Any] = {"format": "png" if format.lower() == "png" else "jpeg",
+                              "quality": max(20, min(int(quality), 95))}
+    params["max_width"] = int(max_width) if max_width else 0
+    csv = _region_csv(region)
+    if csv:
+        params["region"] = csv
+    data, meta = await _gui_fetch_image(params)
+    return _image_result(data, meta, {**meta, "coords": _COORD_HINT})
+
+
+@mcp.tool()
+async def pc_run_steps(
+    steps: List[Dict[str, Any]],
+    screenshot_after: bool = False,
+    region: Optional[List[int]] = None,
+    max_width: int = 1600,
+    settle_ms: int = 250,
+) -> ToolResult:
+    """Run several GUI actions in one call; stops at the first failing step.
+
+    Each step is {"action": ..., ...}. Actions:
+      click {x,y,button?,clicks?} | double_click {x,y} | right_click {x,y} | move {x,y}
+      drag {start_x,start_y,end_x,end_y} | type {text} | key {key:"ctrl+l"} or {keys:[..]}
+      scroll {delta,x?,y?} | wait {ms<=10000} | active_window {}
+      focus_window {window_title} | ui_click {id|name, role?, window_title?, method?}
+      ui_set_text {id|name, text, role?, window_title?, append?}
+    Any step may add "expect_window": "<title substring>" to fail instead of acting
+    when another window is in front (the PC is shared with its owner).
+
+    Args:
+        steps: 1-50 action objects, run in order.
+        screenshot_after: Return one JPEG after the last step (after settle_ms).
+        region: Optional [x0, y0, x1, y1] crop for that screenshot.
+        max_width: Screenshot max width (default 1600).
+        settle_ms: Wait before the final screenshot (default 250).
+    """
+    if not steps:
+        raise ValueError("steps must contain at least one action")
+    if len(steps) > 50:
+        raise ValueError("max 50 steps per batch")
+    body: Dict[str, Any] = {"steps": steps, "screenshot_after": screenshot_after,
+                            "max_width": max_width, "settle_ms": settle_ms}
+    csv = _region_csv(region)
+    if csv:
+        body["region"] = csv
+    res = await _gui_req("/steps", body, timeout=120.0)
+    shot = res.pop("screenshot", None)
+    if shot:
+        res["screenshot_meta"] = {**shot["meta"], "coords": _COORD_HINT}
+        return _image_result(base64.b64decode(shot["data_b64"]), shot["meta"], res)
+    return ToolResult(content=[TextContent(type="text", text=json.dumps(res))])
+
+
+@mcp.tool()
+async def pc_ui_tree(
+    window_title: Optional[str] = None,
+    query: Optional[str] = None,
+    max_depth: int = 12,
+    limit: int = 150,
+    include_unnamed: bool = False,
+) -> Dict[str, Any]:
+    """List named UI elements (Windows UI Automation) of a window: id, role, name, rect.
+
+    Use the returned `id` with `pc_ui_click` / `pc_ui_set_text` instead of guessing
+    coordinates. Ids stay valid while the element exists; re-run after big UI changes.
+
+    Args:
+        window_title: Substring of a top-level window title; default = foreground window.
+        query: Filter by name/automation-id substring, or an exact role (e.g. 'button', 'edit').
+        max_depth: Tree depth to walk (default 12; browsers often need 20-30).
+        limit: Max elements returned (default 150, max 500).
+        include_unnamed: Also return elements without a name.
+    """
+    return await _gui_req("/ui/tree", {"window_title": window_title, "query": query, "max_depth": max_depth,
+                                       "limit": limit, "include_unnamed": include_unnamed}, timeout=30.0)
+
+
+@mcp.tool()
+async def pc_ui_click(
+    id: Optional[str] = None,
+    name: Optional[str] = None,
+    role: Optional[str] = None,
+    window_title: Optional[str] = None,
+    method: str = "auto",
+) -> Dict[str, Any]:
+    """Click a UI element by id (from pc_ui_tree) or by visible name.
+
+    method 'auto' uses the element's Invoke/Toggle/Select pattern (no mouse move)
+    and falls back to a mouse click at its centre; 'mouse' always clicks.
+
+    Args:
+        id: Element id from pc_ui_tree.
+        name: Element name (exact match preferred, else substring) when no id.
+        role: Optional role filter for name lookup, e.g. 'Button', 'MenuItem'.
+        window_title: Window to search for name lookup; default = foreground window.
+        method: 'auto' (default), 'invoke' or 'mouse'.
+    """
+    if not id and not name:
+        raise ValueError("give id or name")
+    return await _gui_req("/ui/click", {"id": id, "name": name, "role": role,
+                                        "window_title": window_title, "method": method}, timeout=30.0)
+
+
+@mcp.tool()
+async def pc_ui_set_text(
+    text: str,
+    id: Optional[str] = None,
+    name: Optional[str] = None,
+    role: Optional[str] = None,
+    window_title: Optional[str] = None,
+    append: bool = False,
+) -> Dict[str, Any]:
+    """Set the text of an input element (UIA ValuePattern, else focus + select-all + type).
+
+    Args:
+        text: Text to put in the field.
+        id: Element id from pc_ui_tree.
+        name: Element name when no id.
+        role: Optional role filter for name lookup (e.g. 'Edit').
+        window_title: Window to search for name lookup; default = foreground window.
+        append: Type after existing text instead of replacing it.
+    """
+    if not id and not name:
+        raise ValueError("give id or name")
+    return await _gui_req("/ui/set_text", {"text": text, "id": id, "name": name, "role": role,
+                                           "window_title": window_title, "append": append}, timeout=30.0)
+
+
+@mcp.tool()
+async def pc_browser_text(tab_match: str = "", max_chars: int = 20000) -> Dict[str, Any]:
+    """Read the active tab of a Chrome/Edge window on the Windows PC as text (UI Automation).
+
+    Default (no tab_match) = topmost real browser window (Electron apps such as OpenBot are
+    skipped). Only the active tab of each window is readable; canvas terminals (xterm.js)
+    are not. For Proxmox work use `ssh pve` instead of the web shell.
+
+    Args:
+        tab_match: Substring of the window's active tab title (e.g. 'Proxmox').
+        max_chars: Max characters of text returned (default 20000).
+    """
+    return await _gui_req("/browser/text", {"tab_match": tab_match, "max_chars": max_chars}, timeout=30.0)
+
+
+@mcp.tool()
+async def pc_click(x: int, y: int, button: str = "left", clicks: int = 1) -> Dict[str, Any]:
+    """Click mouse at (x, y) coordinates on the Windows PC display.
+
+    Args:
+        x: Horizontal pixel coordinate.
+        y: Vertical pixel coordinate.
+        button: 'left', 'right', or 'middle' (default 'left').
+        clicks: 1 for single click, 2 for double click (default 1).
+    """
+    return await _gui_req("/click", {"x": x, "y": y, "button": button, "clicks": clicks})
+
+
+@mcp.tool()
+async def pc_mouse_move(x: int, y: int) -> Dict[str, Any]:
+    """Move mouse cursor to (x, y) coordinates on the Windows PC display."""
+    return await _gui_req("/move", {"x": x, "y": y})
+
+
+@mcp.tool()
+async def pc_mouse_drag(start_x: int, start_y: int, end_x: int, end_y: int, button: str = "left") -> Dict[str, Any]:
+    """Drag mouse from (start_x, start_y) to (end_x, end_y)."""
+    return await _gui_req("/drag", {"start_x": start_x, "start_y": start_y, "end_x": end_x, "end_y": end_y, "button": button})
+
+
+@mcp.tool()
+async def pc_type(text: str) -> Dict[str, Any]:
+    """Type text into the currently active window on the Windows PC."""
+    return await _gui_req("/type", {"text": text})
+
+
+@mcp.tool()
+async def pc_key(key: str) -> Dict[str, Any]:
+    """Press a single key or key combination on the Windows PC.
+
+    Examples: 'enter', 'tab', 'esc', 'backspace', 'ctrl+c', 'ctrl+v', 'alt+tab', 'win+r'.
+    """
+    return await _gui_req("/key", {"key": key})
+
+
+@mcp.tool()
+async def pc_scroll(delta: int, x: Optional[int] = None, y: Optional[int] = None) -> Dict[str, Any]:
+    """Scroll mouse wheel. Positive delta scrolls up, negative scrolls down."""
+    return await _gui_req("/scroll", {"delta": delta, "x": x, "y": y})
+
+
 @admin_tool
 async def pc_kill_process(name_or_pid: str) -> Dict[str, Any]:
     """Terminate a runaway or hung process on the Windows PC by name or PID.
@@ -222,6 +524,8 @@ def main():
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--admin", action="store_true", help="Enable admin tools in a separate stdio session only")
     args = parser.parse_args()
+    if not config.gui_bridge_token:
+        sys.exit(f"workstation-remote-mcp: refusing to start: {_NO_TOKEN}")
     if args.admin:
         if args.transport != "stdio":
             parser.error("--admin is restricted to explicit stdio sessions; shared HTTP/SSE stays read-only")
